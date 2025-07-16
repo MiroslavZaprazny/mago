@@ -14,6 +14,7 @@ use crate::commands::find::FindCommand;
 use crate::commands::format::FormatCommand;
 use crate::commands::init::InitCommand;
 use crate::commands::lint::LintCommand;
+use crate::commands::lsp::LspCommand;
 use crate::commands::self_update::SelfUpdateCommand;
 use crate::error::Error;
 
@@ -25,6 +26,7 @@ pub mod find;
 pub mod format;
 pub mod init;
 pub mod lint;
+pub mod lsp;
 pub mod self_update;
 
 /// Styling for the Mago CLI.
@@ -61,6 +63,9 @@ pub enum MagoCommand {
     /// Update Mago to the latest version.
     #[command(name = "self-update")]
     SelfUpdate(SelfUpdateCommand),
+    /// Update Mago to the latest version.
+    #[command(name = "lsp")]
+    Lsp(LspCommand),
 }
 
 #[derive(Parser, Debug)]

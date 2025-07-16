@@ -94,6 +94,7 @@ indexmap = { version = "2.8.0", features = ["serde"] }
 rand = "0.9.0"
 bitflags = { version = "2.9.1", features = ["serde"] }
 strsim = "0.11.1"
+tower-lsp = "0.20.0"
 
 [dependencies]
 mago-syntax = { workspace = true }
@@ -110,8 +111,9 @@ mago-composer = { workspace = true }
 mago-semantics = { workspace = true }
 mago-codex = { workspace = true }
 mago-analyzer = { workspace = true }
+mago-span = { workspace = true }
 serde = { workspace = true }
-tokio = { workspace = true, features = ["rt", "rt-multi-thread", "time"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "time", "io-std"] }
 clap = { workspace = true }
 ahash = { workspace = true }
 termtree = { workspace = true }
@@ -131,6 +133,7 @@ tracing-subscriber = { workspace = true }
 indicatif = { workspace = true }
 colored = { workspace = true }
 dialoguer = { workspace = true }
+tower-lsp = { workspace = true }
 
 [dev-dependencies]
 temp-env = "0.3.6"
