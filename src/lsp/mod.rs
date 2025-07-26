@@ -127,6 +127,26 @@ impl LanguageServer for MagoLanguageServer {
         })
     }
 
+    async fn references(&self, params: ReferenceParams) -> Result<Option<Vec<Location>>, ServerError> {
+        let workspace_name = self.get_current_workspace_name().await.ok_or_else(|| ServerError {
+            code: ErrorCode::InvalidRequest,
+            message: Cow::Owned("no workspace selected".to_string()),
+            data: None,
+        })?;
+        let workspaces = self.workspaces.read().await;
+        let workspace = workspaces.get(&workspace_name).ok_or_else(|| ServerError {
+            code: ErrorCode::InvalidRequest,
+            message: Cow::Owned("no workspace found".to_string()),
+            data: None,
+        })?;
+
+        workspace
+            .find_references(&params.text_document_position.text_document.uri, &params.text_document_position.position)
+            .await;
+
+        Ok(None)
+    }
+
     async fn initialized(&self, _: InitializedParams) {
         eprintln!("Mago Language Server initialized");
     }
@@ -157,12 +177,6 @@ impl LanguageServer for MagoLanguageServer {
     }
 
     async fn diagnostic(&self, params: DocumentDiagnosticParams) -> ServerResult<DocumentDiagnosticReportResult> {
-        let file = params.text_document.uri.to_file_path().map_err(|_| ServerError {
-            code: ErrorCode::InvalidRequest,
-            message: Cow::Owned(format!("invalid URI: {}", params.text_document.uri)),
-            data: None,
-        })?;
-
         let workspace_name = self.get_current_workspace_name().await.ok_or_else(|| ServerError {
             code: ErrorCode::InvalidRequest,
             message: Cow::Owned("no workspace selected".to_string()),
@@ -172,7 +186,7 @@ impl LanguageServer for MagoLanguageServer {
         let workspaces = self.workspaces.read().await;
         let workspace = workspaces.get(&workspace_name).unwrap();
 
-        let diagnostics = match workspace.get_document_diagnostic(&params.text_document.uri, file).await {
+        let diagnostics = match workspace.get_document_diagnostic(&params.text_document.uri).await {
             Ok(report) => report,
             Err(error) => {
                 return Err(ServerError {

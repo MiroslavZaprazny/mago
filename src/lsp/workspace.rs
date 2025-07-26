@@ -1,26 +1,31 @@
 use std::path::PathBuf;
 
-use ahash::HashMap;
-use ahash::HashMapExt;
-use mago_codex::metadata::CodebaseMetadata;
-use mago_codex::reference::SymbolReferences;
-use mago_names::resolver::NameResolver;
-use mago_reporting::IssueCollection;
-use mago_semantics::SemanticsChecker;
-use mago_syntax::parser::parse_source;
-use tower_lsp::lsp_types::*;
-
 use crate::config::Configuration;
 use crate::error::Error;
 use crate::metadata::compile_codebase_for_sources;
 use crate::source;
+use ahash::HashMap;
+use ahash::HashMapExt;
+use mago_codex::metadata::CodebaseMetadata;
+use mago_codex::reference::SymbolReferences;
 use mago_interner::ThreadedInterner;
+use mago_names::resolver::NameResolver;
 use mago_reporting::AnnotationKind;
 use mago_reporting::Issue;
+use mago_reporting::IssueCollection;
 use mago_reporting::Level;
+use mago_semantics::SemanticsChecker;
+use mago_source::Source;
 use mago_source::SourceCategory;
 use mago_source::SourceManager;
+use mago_span::HasPosition;
+use mago_span::HasSpan;
 use mago_span::Span;
+use mago_syntax::ast::Hint;
+use mago_syntax::ast::Node;
+use mago_syntax::ast::Program;
+use mago_syntax::parser::parse_source;
+use tower_lsp::lsp_types::*;
 
 #[derive(Debug)]
 pub(super) struct MagoWorkspace {
@@ -28,6 +33,8 @@ pub(super) struct MagoWorkspace {
     source_manager: SourceManager,
     issues: IssueCollection,
     codebase: CodebaseMetadata,
+    references: SymbolReferences,
+    program_map: HashMap<Option<PathBuf>, Program>,
 }
 
 impl MagoWorkspace {
@@ -35,10 +42,11 @@ impl MagoWorkspace {
         let configuration = Configuration::from_workspace(root);
         let source_manager = source::load(interner, &configuration.source, true, true).await?;
         let sources: Vec<_> = source_manager.source_ids_for_category(SourceCategory::UserDefined);
+        let references = &mut SymbolReferences::new();
         let length = sources.len();
 
-        let mut codebase =
-            compile_codebase_for_sources(&source_manager, &mut SymbolReferences::new(), interner).await?;
+        let mut codebase = compile_codebase_for_sources(&source_manager, references, interner).await?;
+        eprintln!("references: {:?}", references);
         let mut handles = Vec::with_capacity(length);
 
         for source_id in sources {
@@ -52,29 +60,33 @@ impl MagoWorkspace {
                     let semantics_checker = SemanticsChecker::new(&configuration.php_version, &interner);
                     let (program, parse_error) = parse_source(&interner, &source);
                     let resolved_names = name_resolver.resolve(&program);
+                    eprintln!("resolved names: {:?}", resolved_names);
 
                     let mut semantic_issues = semantics_checker.check(&source, &program, &resolved_names);
                     if let Some(error) = &parse_error {
                         semantic_issues.push(Into::<Issue>::into(error));
                     }
 
-                    Result::<_, Error>::Ok(semantic_issues)
+                    Result::<_, Error>::Ok((source.path, program, semantic_issues))
                 }
             }));
         }
 
-        let mut issues = Vec::with_capacity(length);
+        let mut issues = Vec::new();
+        let mut program_map = HashMap::with_capacity(length);
 
         for handle in handles {
-            let issue_collection = handle.await??;
+            let (path, program, issue_collection) = handle.await??;
 
             issues.extend(issue_collection);
+            program_map.insert(path, program);
         }
         issues.extend(codebase.take_issues(true));
 
         let issues = IssueCollection::from(issues);
+        let references = references.clone();
 
-        Ok(MagoWorkspace { configuration, source_manager, issues, codebase })
+        Ok(MagoWorkspace { configuration, source_manager, issues, codebase, references, program_map })
     }
 
     pub async fn get_workspace_diagnostic_report(&self) -> Result<WorkspaceDiagnosticReport, Error> {
@@ -103,51 +115,80 @@ impl MagoWorkspace {
     pub async fn get_document_diagnostic(
         &self,
         document_url: &Url,
-        path: PathBuf,
     ) -> Result<RelatedFullDocumentDiagnosticReport, Error> {
-        let document_issues: Vec<&Issue> = self
+        let diagnostics: Vec<Diagnostic> = self
             .issues
             .iter()
-            .filter(|issue| {
-                let primary_annotation = issue
-                    .annotations
-                    .iter()
-                    .find(|p| matches!(p.kind, AnnotationKind::Primary))
-                    .expect("issue should have at least one annotation");
-                let span = &primary_annotation.span;
-                let location = span_to_location(&self.source_manager, span).expect("to find issue location");
+            .filter_map(|issue| {
+                let (url, diagnostic) = issue_to_diagnostic("semantics", &self.source_manager, issue).ok()?;
 
-                location.uri == *document_url
+                if url == *document_url { Some(diagnostic) } else { None }
             })
             .collect();
 
-        let mut diagnostics = Vec::new();
-        let mut related_documents = HashMap::default();
-        for issue in document_issues.iter() {
-            tracing::error!("issue: {:?}", issue);
-
-            let (url, diagnostic) = issue_to_diagnostic("semantics", &self.source_manager, issue)?;
-
-            if url == *document_url {
-                diagnostics.push(diagnostic);
-            } else {
-                related_documents
-                    .entry(url)
-                    .or_insert_with(|| FullDocumentDiagnosticReport { result_id: None, items: Vec::new() })
-                    .items
-                    .push(diagnostic);
-            }
-        }
-
         Ok(RelatedFullDocumentDiagnosticReport {
-            related_documents: Some(
-                related_documents
-                    .into_iter()
-                    .map(|(uri, report)| (uri, DocumentDiagnosticReportKind::Full(report)))
-                    .collect(),
-            ),
+            related_documents: None,
             full_document_diagnostic_report: FullDocumentDiagnosticReport { result_id: None, items: diagnostics },
         })
+    }
+
+    pub async fn find_references(&self, document_url: &Url, position: &Position) {
+        let path = PathBuf::from(document_url.path());
+        if let Some(program) = self.program_map.get(&Some(path)) {
+            if let Some(node) = get_node_for_position(
+                &Node::Program(&program),
+                &self.source_manager.load(&program.source).unwrap(),
+                position,
+            ) {
+                match node {
+                    Node::FunctionLikeParameter(parameter) => {
+                        if let Some(hint) = parameter.hint.clone() {
+                            match hint {
+                                Hint::Identifier(id) => {
+                                    todo!("find references");
+                                    //self.references.get_symbol_references_to_symbols_in_signature().get(&id)
+                                }
+                                _ => todo!(),
+                            }
+                        }
+                    }
+                    _ => {
+                        todo!()
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn get_node_for_position<'a>(node: &Node<'a>, source: &Source, needle: &Position) -> Option<Node<'a>> {
+    let range = get_range(node, source);
+
+    if (range.start.line..=range.end.line).contains(&needle.line)
+        && (range.start.character..=range.end.character).contains(&needle.character)
+    {
+        return Some(*node);
+    }
+
+    for node in node.children() {
+        if let Some(n) = get_node_for_position(&node, source, needle) {
+            return Some(n);
+        }
+    }
+
+    None
+}
+
+fn get_range(node: impl HasSpan, source: &Source) -> Range {
+    Range {
+        start: Position {
+            line: (source.line_number(node.start_position().offset())) as u32,
+            character: (source.column_number(node.start_position().offset())) as u32,
+        },
+        end: Position {
+            line: (source.line_number(node.end_position().offset())) as u32,
+            character: (source.column_number(node.end_position().offset())) as u32,
+        },
     }
 }
 
